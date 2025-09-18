@@ -22,6 +22,8 @@
 #include "tf2_eigen/tf2_eigen.h"
 #include <mbf_costmap_core/costmap_controller.h>
 #include <visualization_msgs/Marker.h>
+#include <vector>
+#include <utility>
 
 namespace ftc_local_planner
 {
@@ -57,6 +59,9 @@ namespace ftc_local_planner
         ros::Publisher global_plan_pub;
         ros::Publisher progress_pub;
         ros::Publisher obstacle_marker_pub;
+        ros::Publisher corridor_centerline_pub_;
+        ros::Publisher best_trajectory_pub_;
+        ros::Publisher corridor_boundary_pub_;
 
         FTCPlannerConfig config;
 
@@ -95,6 +100,8 @@ namespace ftc_local_planner
         bool oscillation_detected_ = false;
         bool oscillation_warning_ = false;
 
+        std::vector<Eigen::Vector2d> last_best_path_world_;
+
         double distanceLookahead();
         PlannerState update_planner_state();
         void update_control_point(double dt);
@@ -126,6 +133,22 @@ namespace ftc_local_planner
          * @return sum of `values`, or 0.0 if `values` is empty.
          */
         void debugObstacle(visualization_msgs::Marker &obstacle_points, double x, double y, unsigned char cost, int maxIDs);
+
+        bool planCorridorTarget(const Eigen::Affine3d &fallback, Eigen::Affine3d &corridor_target);
+        bool extractLocalCenterline(std::string &frame_id, std::vector<Eigen::Vector2d> &centerline,
+                                    std::vector<double> &headings, std::vector<double> &cumulative_distance,
+                                    std::vector<size_t> &indices);
+        void computeCorridorBounds(const std::vector<Eigen::Vector2d> &centerline, const std::vector<double> &headings,
+                                   std::vector<std::pair<double, double>> &bounds);
+        bool generateBestTrajectory(const std::vector<Eigen::Vector2d> &centerline, const std::vector<double> &headings,
+                                    const std::vector<double> &cumulative_distance,
+                                    const std::vector<std::pair<double, double>> &bounds,
+                                    std::vector<Eigen::Vector2d> &best_path);
+        double costAt(const Eigen::Vector2d &point, bool &lethal);
+        double segmentCollisionCost(const Eigen::Vector2d &from, const Eigen::Vector2d &to, bool &lethal);
+        void publishCorridorDebug(const std::string &frame_id, const std::vector<Eigen::Vector2d> &centerline,
+                                  const std::vector<double> &headings, const std::vector<std::pair<double, double>> &bounds,
+                                  const std::vector<Eigen::Vector2d> &best_path);
 
         double time_in_current_state()
         {

@@ -47,7 +47,20 @@ namespace ftc_local_planner
 
         costmap = costmap_ros;
         costmap_map_ = costmap->getCostmap();
-        tf_buffer = tf;
+
+        if (tf)
+        {
+            tf_buffer = tf;
+            tf_buffer_owner_.reset();
+            tf_listener_owner_.reset();
+        }
+        else
+        {
+            ROS_WARN("FTCPlanner received null tf2 buffer pointer; creating internal listener.");
+            tf_buffer_owner_.reset(new tf2_ros::Buffer);
+            tf_listener_owner_.reset(new tf2_ros::TransformListener(*tf_buffer_owner_));
+            tf_buffer = tf_buffer_owner_.get();
+        }
 
         // Parameter for dynamic reconfigure
         reconfig_server = new dynamic_reconfigure::Server<FTCPlannerConfig>(private_nh);
@@ -69,17 +82,6 @@ namespace ftc_local_planner
         initialized_ = true;
 
         ROS_INFO("FTCLocalPlannerROS: Version 2 Init.");
-    }
-
-    void FTCPlanner::initialize(std::string name, tf::TransformListener *tf, costmap_2d::Costmap2DROS *costmap_ros)
-    {
-        tf_buffer_owner_.reset(new tf2_ros::Buffer);
-        tf_listener_legacy_.reset(new tf2_ros::TransformListener(*tf_buffer_owner_));
-        if (tf == nullptr)
-        {
-            ROS_WARN("FTCPlanner received null tf::TransformListener pointer; using internal tf2 listener only.");
-        }
-        initialize(name, tf_buffer_owner_.get(), costmap_ros);
     }
 
     void FTCPlanner::reconfigureCB(FTCPlannerConfig &c, uint32_t level)

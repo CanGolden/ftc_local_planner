@@ -11,7 +11,6 @@
 #include <geometry_msgs/Twist.h>
 #include <geometry_msgs/TwistStamped.h>
 #include <costmap_2d/costmap_2d_ros.h>
-#include <tf/transform_listener.h>
 #include <dynamic_reconfigure/server.h>
 #include <ftc_local_planner/FTCPlannerConfig.h>
 #include <ftc_local_planner/PID.h>
@@ -55,7 +54,7 @@ namespace ftc_local_planner
 
         tf2_ros::Buffer *tf_buffer;
         std::unique_ptr<tf2_ros::Buffer> tf_buffer_owner_;
-        std::unique_ptr<tf2_ros::TransformListener> tf_listener_legacy_;
+        std::unique_ptr<tf2_ros::TransformListener> tf_listener_owner_;
         costmap_2d::Costmap2DROS *costmap;
         costmap_2d::Costmap2D* costmap_map_;
         bool initialized_ = false;
@@ -169,7 +168,6 @@ namespace ftc_local_planner
 
         bool getProgress(ftc_local_planner::PlannerGetProgressRequest &req, ftc_local_planner::PlannerGetProgressResponse &res);
 
-        void initialize(std::string name, tf::TransformListener *tf, costmap_2d::Costmap2DROS *costmap_ros) override;
         bool setPlan(const std::vector<geometry_msgs::PoseStamped> &plan) override;
 
         void initialize(std::string name, tf2_ros::Buffer *tf, costmap_2d::Costmap2DROS *costmap_ros) override;

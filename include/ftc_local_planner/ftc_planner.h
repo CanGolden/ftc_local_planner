@@ -8,6 +8,8 @@
 
 #include <nav_msgs/Odometry.h>
 #include <nav_msgs/Path.h>
+#include <geometry_msgs/Twist.h>
+#include <geometry_msgs/TwistStamped.h>
 #include <costmap_2d/costmap_2d_ros.h>
 #include <tf/transform_listener.h>
 #include <dynamic_reconfigure/server.h>
@@ -22,11 +24,14 @@
 #include "tf2_eigen/tf2_eigen.h"
 #include <mbf_costmap_core/costmap_controller.h>
 #include <visualization_msgs/Marker.h>
+#include <vector>
+#include <utility>
+#include <memory>
 
 namespace ftc_local_planner
 {
 
-    class FTCPlanner : public mbf_costmap_core::CostmapController
+    class FTCPlanner : public mbf_costmap_core::CostmapController, public nav_core::BaseLocalPlanner
     {
 
         enum PlannerState
@@ -49,14 +54,20 @@ namespace ftc_local_planner
         dynamic_reconfigure::Server<FTCPlannerConfig> *reconfig_server;
 
         tf2_ros::Buffer *tf_buffer;
+        std::unique_ptr<tf2_ros::Buffer> tf_buffer_owner_;
+        std::unique_ptr<tf2_ros::TransformListener> tf_listener_legacy_;
         costmap_2d::Costmap2DROS *costmap;
-        costmap_2d::Costmap2D* costmap_map_;   
+        costmap_2d::Costmap2D* costmap_map_;
+        bool initialized_ = false;
 
         std::vector<geometry_msgs::PoseStamped> global_plan;
         ros::Publisher global_point_pub;
         ros::Publisher global_plan_pub;
         ros::Publisher progress_pub;
         ros::Publisher obstacle_marker_pub;
+        ros::Publisher corridor_centerline_pub_;
+        ros::Publisher best_trajectory_pub_;
+        ros::Publisher corridor_boundary_pub_;
 
         FTCPlannerConfig config;
 
@@ -95,6 +106,8 @@ namespace ftc_local_planner
         bool oscillation_detected_ = false;
         bool oscillation_warning_ = false;
 
+        std::vector<Eigen::Vector2d> last_best_path_world_;
+
         double distanceLookahead();
         PlannerState update_planner_state();
         void update_control_point(double dt);
@@ -127,6 +140,23 @@ namespace ftc_local_planner
          */
         void debugObstacle(visualization_msgs::Marker &obstacle_points, double x, double y, unsigned char cost, int maxIDs);
 
+        bool planCorridorTarget(const Eigen::Affine3d &fallback, Eigen::Affine3d &corridor_target);
+        bool extractLocalCenterline(std::string &frame_id, std::vector<Eigen::Vector2d> &centerline,
+                                    std::vector<double> &headings, std::vector<double> &cumulative_distance,
+                                    std::vector<size_t> &indices);
+        void computeCorridorBounds(const std::vector<Eigen::Vector2d> &centerline, const std::vector<double> &headings,
+                                   std::vector<std::pair<double, double>> &bounds);
+        bool generateBestTrajectory(const std::vector<Eigen::Vector2d> &centerline, const std::vector<double> &headings,
+                                    const std::vector<double> &cumulative_distance,
+                                    const std::vector<std::pair<double, double>> &bounds,
+                                    std::vector<Eigen::Vector2d> &best_path);
+        double costAt(const Eigen::Vector2d &point, bool &lethal, unsigned char *raw_cost = nullptr);
+        double segmentCollisionCost(const Eigen::Vector2d &from, const Eigen::Vector2d &to, double &dynamic_cost, bool &lethal);
+        double dynamicRisk(unsigned char cost) const;
+        void publishCorridorDebug(const std::string &frame_id, const std::vector<Eigen::Vector2d> &centerline,
+                                  const std::vector<double> &headings, const std::vector<std::pair<double, double>> &bounds,
+                                  const std::vector<Eigen::Vector2d> &best_path);
+
         double time_in_current_state()
         {
             return (ros::Time::now() - state_entered_time).toSec();
@@ -139,17 +169,20 @@ namespace ftc_local_planner
 
         bool getProgress(ftc_local_planner::PlannerGetProgressRequest &req, ftc_local_planner::PlannerGetProgressResponse &res);
 
+        void initialize(std::string name, tf::TransformListener *tf, costmap_2d::Costmap2DROS *costmap_ros) override;
         bool setPlan(const std::vector<geometry_msgs::PoseStamped> &plan) override;
 
         void initialize(std::string name, tf2_ros::Buffer *tf, costmap_2d::Costmap2DROS *costmap_ros) override;
 
         ~FTCPlanner() override;
 
+        bool computeVelocityCommands(geometry_msgs::Twist &cmd_vel) override;
         uint32_t
         computeVelocityCommands(const geometry_msgs::PoseStamped &pose, const geometry_msgs::TwistStamped &velocity,
                                 geometry_msgs::TwistStamped &cmd_vel, std::string &message) override;
 
         bool isGoalReached(double dist_tolerance, double angle_tolerance) override;
+        bool isGoalReached() override;
 
         bool cancel() override;
     };

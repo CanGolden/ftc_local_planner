@@ -42,6 +42,6 @@
 
     <export>
         <mbf_costmap_core plugin="${prefix}/mbf_plugin.xml"/>
-        <nav_core plugin="${prefix}/recovery_plugin.xml" />
+        <nav_core plugin="${prefix}/nav_core_plugin.xml" />
     </export>
 </package>

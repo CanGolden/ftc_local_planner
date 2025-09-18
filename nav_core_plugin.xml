@@ -1,0 +1,14 @@
+<library path="lib/libftc_local_planner">
+  <class name="ftc_local_planner/FTCPlanner" type="ftc_local_planner::FTCPlanner" base_class_type="nav_core::BaseLocalPlanner">
+    <description>
+      A local planner that follows a global path and performs corridor-based obstacle avoidance.
+    </description>
+  </class>
+</library>
+<library path="lib/libbackward_forward_recovery">
+  <class name="ftc_local_planner/BackwardForwardRecovery" type="ftc_local_planner::BackwardForwardRecovery" base_class_type="nav_core::RecoveryBehavior">
+    <description>
+      A simple recovery behavior plugin to try driving directly backwards and forwards.
+    </description>
+  </class>
+</library>

@@ -1,10 +1,17 @@
 
 #include <ftc_local_planner/ftc_planner.h>
 
+#include <algorithm>
+#include <limits>
+#include <cmath>
+
 #include <pluginlib/class_list_macros.h>
 #include "mbf_msgs/ExePathAction.h"
+#include <tf2/utils.h>
+#include <costmap_2d/cost_values.h>
 
 PLUGINLIB_EXPORT_CLASS(ftc_local_planner::FTCPlanner, mbf_costmap_core::CostmapController)
+PLUGINLIB_EXPORT_CLASS(ftc_local_planner::FTCPlanner, nav_core::BaseLocalPlanner)
 
 #define RET_SUCCESS 0
 #define RET_COLLISION 104
@@ -14,11 +21,18 @@ namespace ftc_local_planner
 {
 
     FTCPlanner::FTCPlanner()
+        : reconfig_server(nullptr), tf_buffer(nullptr), costmap(nullptr), costmap_map_(nullptr)
     {
     }
 
     void FTCPlanner::initialize(std::string name, tf2_ros::Buffer *tf, costmap_2d::Costmap2DROS *costmap_ros)
     {
+        if (initialized_)
+        {
+            ROS_WARN_STREAM("FTCPlanner already initialized; ignoring duplicate call for " << name);
+            return;
+        }
+
         ros::NodeHandle private_nh("~/" + name);
 
         progress_server = private_nh.advertiseService(
@@ -27,6 +41,9 @@ namespace ftc_local_planner
         global_point_pub = private_nh.advertise<geometry_msgs::PoseStamped>("global_point", 1);
         global_plan_pub = private_nh.advertise<nav_msgs::Path>("global_plan", 1, true);
         obstacle_marker_pub = private_nh.advertise<visualization_msgs::Marker>("costmap_marker", 10);
+        corridor_centerline_pub_ = private_nh.advertise<nav_msgs::Path>("corridor_centerline", 1);
+        best_trajectory_pub_ = private_nh.advertise<nav_msgs::Path>("best_corridor_trajectory", 1);
+        corridor_boundary_pub_ = private_nh.advertise<visualization_msgs::Marker>("corridor_bounds", 1);
 
         costmap = costmap_ros;
         costmap_map_ = costmap->getCostmap();
@@ -49,7 +66,20 @@ namespace ftc_local_planner
         // Recovery behavior initialization
         failure_detector_.setBufferLength(std::round(config.oscillation_recovery_min_duration * 10));
 
+        initialized_ = true;
+
         ROS_INFO("FTCLocalPlannerROS: Version 2 Init.");
+    }
+
+    void FTCPlanner::initialize(std::string name, tf::TransformListener *tf, costmap_2d::Costmap2DROS *costmap_ros)
+    {
+        tf_buffer_owner_.reset(new tf2_ros::Buffer);
+        tf_listener_legacy_.reset(new tf2_ros::TransformListener(*tf_buffer_owner_));
+        if (tf == nullptr)
+        {
+            ROS_WARN("FTCPlanner received null tf::TransformListener pointer; using internal tf2 listener only.");
+        }
+        initialize(name, tf_buffer_owner_.get(), costmap_ros);
     }
 
     void FTCPlanner::reconfigureCB(FTCPlannerConfig &c, uint32_t level)
@@ -106,6 +136,7 @@ namespace ftc_local_planner
             state_entered_time = ros::Time::now();
         }
         global_plan_pub.publish(path);
+        last_best_path_world_.clear();
 
         ROS_INFO_STREAM("FTCLocalPlannerROS: Got new global plan with " << plan.size() << " points.");
 
@@ -119,6 +150,43 @@ namespace ftc_local_planner
             delete reconfig_server;
             reconfig_server = nullptr;
         }
+    }
+
+    bool FTCPlanner::computeVelocityCommands(geometry_msgs::Twist &cmd_vel)
+    {
+        if (!initialized_)
+        {
+            ROS_ERROR("FTCPlanner has not been initialized; cannot compute velocity commands.");
+            return false;
+        }
+
+        geometry_msgs::PoseStamped robot_pose;
+        if (!costmap->getRobotPose(robot_pose))
+        {
+            ROS_WARN("FTCPlanner could not retrieve the robot pose for computeVelocityCommands.");
+            return false;
+        }
+
+        geometry_msgs::TwistStamped robot_velocity;
+        robot_velocity.header = robot_pose.header;
+
+        geometry_msgs::TwistStamped cmd_vel_stamped;
+        std::string message;
+        uint32_t result = computeVelocityCommands(robot_pose, robot_velocity, cmd_vel_stamped, message);
+
+        cmd_vel = cmd_vel_stamped.twist;
+
+        if (result == RET_SUCCESS)
+        {
+            return true;
+        }
+
+        if (!message.empty())
+        {
+            ROS_DEBUG_STREAM("FTCPlanner nav_core computeVelocityCommands failed: " << message);
+        }
+
+        return false;
     }
 
     double FTCPlanner::distanceLookahead()
@@ -210,6 +278,13 @@ namespace ftc_local_planner
 
 
     bool FTCPlanner::isGoalReached(double dist_tolerance, double angle_tolerance)
+    {
+        (void)dist_tolerance;
+        (void)angle_tolerance;
+        return current_state == FINISHED && !is_crashed;
+    }
+
+    bool FTCPlanner::isGoalReached()
     {
         return current_state == FINISHED && !is_crashed;
     }
@@ -403,7 +478,24 @@ namespace ftc_local_planner
             result.translation() = (1.0 - current_progress) * trans1 + current_progress * trans2;
             result.linear() = rot1.slerp(current_progress, rot2).toRotationMatrix();
 
-            current_control_point = result;
+            if (config.enable_corridor_planning)
+            {
+                Eigen::Affine3d corridor_target;
+                if (planCorridorTarget(result, corridor_target))
+                {
+                    current_control_point = corridor_target;
+                }
+                else
+                {
+                    last_best_path_world_.clear();
+                    current_control_point = result;
+                }
+            }
+            else
+            {
+                last_best_path_world_.clear();
+                current_control_point = result;
+            }
         }
         break;
         case POST_ROTATE:
@@ -427,6 +519,591 @@ namespace ftc_local_planner
         lat_error = local_control_point.translation().y();
         lon_error = local_control_point.translation().x();
         angle_error = local_control_point.rotation().eulerAngles(0, 1, 2).z();
+    }
+
+    bool FTCPlanner::planCorridorTarget(const Eigen::Affine3d &fallback, Eigen::Affine3d &corridor_target)
+    {
+        std::string frame_id;
+        std::vector<Eigen::Vector2d> centerline;
+        std::vector<double> headings;
+        std::vector<double> cumulative_distance;
+        std::vector<size_t> indices;
+        if (!extractLocalCenterline(frame_id, centerline, headings, cumulative_distance, indices))
+        {
+            return false;
+        }
+
+        std::vector<std::pair<double, double>> bounds(centerline.size(), std::make_pair(0.0, 0.0));
+        computeCorridorBounds(centerline, headings, bounds);
+
+        std::vector<Eigen::Vector2d> best_path;
+        if (!generateBestTrajectory(centerline, headings, cumulative_distance, bounds, best_path))
+        {
+            return false;
+        }
+
+        if (best_path.empty())
+        {
+            return false;
+        }
+
+        double lookahead_distance = std::max(0.0, config.corridor_tracking_lookahead);
+        size_t tracking_index = 0;
+        double accumulated = 0.0;
+        for (size_t i = 1; i < best_path.size(); ++i)
+        {
+            accumulated += (best_path[i] - best_path[i - 1]).norm();
+            if (accumulated >= lookahead_distance)
+            {
+                tracking_index = i;
+                break;
+            }
+        }
+        if (tracking_index >= best_path.size())
+        {
+            tracking_index = best_path.size() - 1;
+        }
+
+        Eigen::Vector2d heading_vec(1.0, 0.0);
+        if (tracking_index + 1 < best_path.size())
+        {
+            heading_vec = best_path[tracking_index + 1] - best_path[tracking_index];
+        }
+        else if (tracking_index > 0)
+        {
+            heading_vec = best_path[tracking_index] - best_path[tracking_index - 1];
+        }
+        else if (!headings.empty())
+        {
+            heading_vec = Eigen::Vector2d(std::cos(headings.front()), std::sin(headings.front()));
+        }
+
+        if (heading_vec.squaredNorm() < 1e-9)
+        {
+            double fallback_yaw = std::atan2(fallback.linear()(1, 0), fallback.linear()(0, 0));
+            heading_vec = Eigen::Vector2d(std::cos(fallback_yaw), std::sin(fallback_yaw));
+        }
+
+        double yaw = std::atan2(heading_vec.y(), heading_vec.x());
+
+        corridor_target = Eigen::Affine3d::Identity();
+        corridor_target.translation() = Eigen::Vector3d(best_path[tracking_index].x(), best_path[tracking_index].y(),
+                                                       fallback.translation().z());
+        corridor_target.linear() = Eigen::AngleAxisd(yaw, Eigen::Vector3d::UnitZ()).toRotationMatrix();
+
+        publishCorridorDebug(frame_id, centerline, headings, bounds, best_path);
+        last_best_path_world_ = best_path;
+
+        return true;
+    }
+
+    bool FTCPlanner::extractLocalCenterline(std::string &frame_id, std::vector<Eigen::Vector2d> &centerline,
+                                            std::vector<double> &headings, std::vector<double> &cumulative_distance,
+                                            std::vector<size_t> &indices)
+    {
+        if (global_plan.size() < 2 || current_index >= global_plan.size())
+        {
+            return false;
+        }
+
+        frame_id = global_plan[current_index].header.frame_id;
+        centerline.clear();
+        headings.clear();
+        cumulative_distance.clear();
+        indices.clear();
+
+        double max_length = std::max(0.1, config.corridor_length);
+        double accumulated_distance = 0.0;
+
+        auto poseToVector = [](const geometry_msgs::PoseStamped &pose) {
+            return Eigen::Vector2d(pose.pose.position.x, pose.pose.position.y);
+        };
+
+        Eigen::Vector2d last_point = poseToVector(global_plan[current_index]);
+        centerline.push_back(last_point);
+        cumulative_distance.push_back(0.0);
+        indices.push_back(current_index);
+
+        size_t idx = current_index;
+        while (idx + 1 < global_plan.size() && accumulated_distance < max_length)
+        {
+            Eigen::Vector2d current_point = poseToVector(global_plan[idx]);
+            Eigen::Vector2d next_point = poseToVector(global_plan[idx + 1]);
+
+            double dist = (next_point - current_point).norm();
+            if (dist < 1e-6)
+            {
+                idx++;
+                continue;
+            }
+
+            accumulated_distance += dist;
+            centerline.push_back(next_point);
+            cumulative_distance.push_back(accumulated_distance);
+            indices.push_back(idx + 1);
+            last_point = next_point;
+            idx++;
+        }
+
+        if (centerline.size() < 2)
+        {
+            return false;
+        }
+
+        headings.resize(centerline.size(), 0.0);
+        for (size_t i = 0; i < centerline.size(); ++i)
+        {
+            Eigen::Vector2d direction(0.0, 0.0);
+            if (i + 1 < centerline.size())
+            {
+                direction = centerline[i + 1] - centerline[i];
+            }
+            else if (i > 0)
+            {
+                direction = centerline[i] - centerline[i - 1];
+            }
+
+            if (direction.norm() > 1e-6)
+            {
+                headings[i] = std::atan2(direction.y(), direction.x());
+            }
+            else
+            {
+                double yaw = tf2::getYaw(global_plan[indices[i]].pose.orientation);
+                headings[i] = yaw;
+            }
+        }
+
+        return true;
+    }
+
+    void FTCPlanner::computeCorridorBounds(const std::vector<Eigen::Vector2d> &centerline,
+                                           const std::vector<double> &headings,
+                                           std::vector<std::pair<double, double>> &bounds)
+    {
+        if (centerline.empty())
+        {
+            return;
+        }
+
+        double max_width = std::max(0.0, config.corridor_max_half_width);
+        double resolution = std::max(0.01, config.corridor_lateral_resolution);
+        double lethal_threshold = config.corridor_lethal_cost;
+
+        for (size_t i = 0; i < centerline.size(); ++i)
+        {
+            Eigen::Vector2d normal(-std::sin(headings[i]), std::cos(headings[i]));
+            double positive_limit = 0.0;
+            double negative_limit = 0.0;
+
+            for (double offset = resolution; offset <= max_width + 1e-6; offset += resolution)
+            {
+                bool lethal = false;
+                unsigned char raw_cost = 0;
+                Eigen::Vector2d test_point = centerline[i] + normal * offset;
+                costAt(test_point, lethal, &raw_cost);
+                if (lethal || static_cast<double>(raw_cost) >= lethal_threshold)
+                {
+                    break;
+                }
+                positive_limit = offset;
+            }
+
+            for (double offset = resolution; offset <= max_width + 1e-6; offset += resolution)
+            {
+                bool lethal = false;
+                unsigned char raw_cost = 0;
+                Eigen::Vector2d test_point = centerline[i] - normal * offset;
+                costAt(test_point, lethal, &raw_cost);
+                if (lethal || static_cast<double>(raw_cost) >= lethal_threshold)
+                {
+                    break;
+                }
+                negative_limit = offset;
+            }
+
+            bounds[i].first = -negative_limit;
+            bounds[i].second = positive_limit;
+        }
+    }
+
+    bool FTCPlanner::generateBestTrajectory(const std::vector<Eigen::Vector2d> &centerline,
+                                            const std::vector<double> &headings,
+                                            const std::vector<double> &cumulative_distance,
+                                            const std::vector<std::pair<double, double>> &bounds,
+                                            std::vector<Eigen::Vector2d> &best_path)
+    {
+        best_path.clear();
+
+        if (centerline.empty())
+        {
+            return false;
+        }
+
+        size_t N = centerline.size();
+        int lateral_samples = std::max(0, config.corridor_lateral_samples);
+        double max_offset = std::max(0.0, config.corridor_max_half_width);
+
+        std::vector<double> offset_samples;
+        offset_samples.push_back(0.0);
+        if (lateral_samples > 0 && max_offset > 0.0)
+        {
+            double step = max_offset / static_cast<double>(lateral_samples);
+            for (int i = 1; i <= lateral_samples; ++i)
+            {
+                double value = step * static_cast<double>(i);
+                offset_samples.push_back(value);
+                offset_samples.push_back(-value);
+            }
+        }
+        std::sort(offset_samples.begin(), offset_samples.end());
+
+        size_t K = offset_samples.size();
+        const double INF = std::numeric_limits<double>::infinity();
+
+        std::vector<std::vector<double>> dp(N, std::vector<double>(K, INF));
+        std::vector<std::vector<int>> parent(N, std::vector<int>(K, -1));
+        std::vector<std::vector<bool>> valid(N, std::vector<bool>(K, false));
+        std::vector<std::vector<Eigen::Vector2d>> points(N, std::vector<Eigen::Vector2d>(K, Eigen::Vector2d::Zero()));
+        std::vector<std::vector<double>> point_costs(N, std::vector<double>(K, INF));
+
+        double collision_weight = std::max(0.0, config.corridor_collision_weight);
+        double offset_weight = std::max(0.0, config.corridor_offset_weight);
+        double smoothness_weight = std::max(0.0, config.corridor_smoothness_weight);
+        double progress_weight = std::max(0.0, config.corridor_progress_weight);
+        double dynamic_weight = std::max(0.0, config.corridor_dynamic_weight);
+
+        for (size_t i = 0; i < N; ++i)
+        {
+            Eigen::Vector2d normal(-std::sin(headings[i]), std::cos(headings[i]));
+            for (size_t j = 0; j < K; ++j)
+            {
+                double offset = offset_samples[j];
+                if (offset < bounds[i].first - 1e-6 || offset > bounds[i].second + 1e-6)
+                {
+                    continue;
+                }
+                Eigen::Vector2d candidate = centerline[i] + normal * offset;
+                bool lethal = false;
+                unsigned char raw_cost = 0;
+                double collision_cost = costAt(candidate, lethal, &raw_cost);
+                if (lethal)
+                {
+                    continue;
+                }
+                points[i][j] = candidate;
+                valid[i][j] = true;
+                double dynamic_cost = dynamic_weight * dynamicRisk(raw_cost);
+                double point_cost = collision_weight * collision_cost + offset_weight * offset * offset + dynamic_cost;
+                if (i > 0)
+                {
+                    point_cost -= progress_weight * (cumulative_distance[i] - cumulative_distance[i - 1]);
+                }
+                else
+                {
+                    point_cost -= progress_weight * cumulative_distance[i];
+                }
+                point_costs[i][j] = point_cost;
+                if (i == 0)
+                {
+                    dp[i][j] = point_cost;
+                }
+            }
+        }
+
+        for (size_t i = 1; i < N; ++i)
+        {
+            for (size_t j = 0; j < K; ++j)
+            {
+                if (!valid[i][j])
+                {
+                    continue;
+                }
+
+                double point_cost = point_costs[i][j];
+                if (!std::isfinite(point_cost))
+                {
+                    continue;
+                }
+
+                double offset = offset_samples[j];
+                for (size_t pj = 0; pj < K; ++pj)
+                {
+                    if (!valid[i - 1][pj])
+                    {
+                        continue;
+                    }
+
+                    if (dp[i - 1][pj] >= INF)
+                    {
+                        continue;
+                    }
+
+                    bool lethal = false;
+                    double seg_dynamic = 0.0;
+                    double seg_cost = segmentCollisionCost(points[i - 1][pj], points[i][j], seg_dynamic, lethal);
+                    if (lethal)
+                    {
+                        continue;
+                    }
+
+                    double smooth_cost = smoothness_weight * std::pow(offset - offset_samples[pj], 2);
+                    double total = dp[i - 1][pj] + point_cost + collision_weight * seg_cost + smooth_cost +
+                                   dynamic_weight * seg_dynamic;
+                    if (total < dp[i][j])
+                    {
+                        dp[i][j] = total;
+                        parent[i][j] = static_cast<int>(pj);
+                    }
+                }
+            }
+        }
+
+        double best_cost = INF;
+        int best_index = -1;
+        size_t best_stage = N - 1;
+        for (size_t j = 0; j < K; ++j)
+        {
+            if (!valid[N - 1][j])
+            {
+                continue;
+            }
+            if (dp[N - 1][j] < best_cost)
+            {
+                best_cost = dp[N - 1][j];
+                best_index = static_cast<int>(j);
+                best_stage = N - 1;
+            }
+        }
+
+        if (best_index < 0)
+        {
+            for (size_t i = N; i-- > 0;)
+            {
+                for (size_t j = 0; j < K; ++j)
+                {
+                    if (!valid[i][j])
+                    {
+                        continue;
+                    }
+                    if (dp[i][j] < best_cost)
+                    {
+                        best_cost = dp[i][j];
+                        best_index = static_cast<int>(j);
+                        best_stage = i;
+                    }
+                }
+                if (best_index >= 0)
+                {
+                    break;
+                }
+            }
+        }
+
+        if (best_index < 0)
+        {
+            return false;
+        }
+
+        std::vector<Eigen::Vector2d> reversed_path;
+        size_t stage = best_stage;
+        int idx = best_index;
+        while (idx >= 0 && stage < N)
+        {
+            reversed_path.push_back(points[stage][idx]);
+            idx = parent[stage][idx];
+            if (stage == 0)
+            {
+                break;
+            }
+            stage--;
+        }
+
+        if (reversed_path.empty())
+        {
+            return false;
+        }
+
+        best_path.assign(reversed_path.rbegin(), reversed_path.rend());
+        return true;
+    }
+
+    double FTCPlanner::costAt(const Eigen::Vector2d &point, bool &lethal, unsigned char *raw_cost)
+    {
+        lethal = false;
+        unsigned int mx = 0, my = 0;
+        if (!costmap_map_->worldToMap(point.x(), point.y(), mx, my))
+        {
+            lethal = true;
+            if (raw_cost)
+            {
+                *raw_cost = costmap_2d::LETHAL_OBSTACLE;
+            }
+            return 1.0;
+        }
+
+        unsigned char cost = costmap_map_->getCost(mx, my);
+        if (raw_cost)
+        {
+            *raw_cost = cost;
+        }
+        if (cost >= config.corridor_lethal_cost)
+        {
+            lethal = true;
+        }
+
+        return static_cast<double>(cost) / 255.0;
+    }
+
+    double FTCPlanner::segmentCollisionCost(const Eigen::Vector2d &from, const Eigen::Vector2d &to, double &dynamic_cost, bool &lethal)
+    {
+        lethal = false;
+        dynamic_cost = 0.0;
+        Eigen::Vector2d delta = to - from;
+        double length = delta.norm();
+        double step = std::max(0.01, config.corridor_sampling_step);
+        int steps = std::max(1, static_cast<int>(std::ceil(length / step)));
+
+        double total_cost = 0.0;
+        double total_dynamic = 0.0;
+        for (int i = 1; i <= steps; ++i)
+        {
+            double ratio = static_cast<double>(i) / static_cast<double>(steps);
+            Eigen::Vector2d sample = from + delta * ratio;
+            bool sample_lethal = false;
+            unsigned char raw_cost = 0;
+            double c = costAt(sample, sample_lethal, &raw_cost);
+            if (sample_lethal)
+            {
+                lethal = true;
+                return std::numeric_limits<double>::infinity();
+            }
+            total_cost += c;
+            total_dynamic += dynamicRisk(raw_cost);
+        }
+
+        dynamic_cost = total_dynamic / static_cast<double>(steps);
+        return total_cost / static_cast<double>(steps);
+    }
+
+    double FTCPlanner::dynamicRisk(unsigned char cost) const
+    {
+        if (cost <= costmap_2d::INSCRIBED_INFLATED_OBSTACLE)
+        {
+            return 0.0;
+        }
+
+        double lethal_threshold = std::max(config.corridor_lethal_cost,
+                                            static_cast<double>(costmap_2d::INSCRIBED_INFLATED_OBSTACLE) + 1.0);
+        if (static_cast<double>(cost) >= lethal_threshold)
+        {
+            return 1.0;
+        }
+
+        double range = lethal_threshold - static_cast<double>(costmap_2d::INSCRIBED_INFLATED_OBSTACLE);
+        if (range <= 0.0)
+        {
+            return 1.0;
+        }
+
+        double normalized = (static_cast<double>(cost) - static_cast<double>(costmap_2d::INSCRIBED_INFLATED_OBSTACLE)) / range;
+        return std::min(1.0, std::max(0.0, normalized));
+    }
+
+    void FTCPlanner::publishCorridorDebug(const std::string &frame_id, const std::vector<Eigen::Vector2d> &centerline,
+                                          const std::vector<double> &headings,
+                                          const std::vector<std::pair<double, double>> &bounds,
+                                          const std::vector<Eigen::Vector2d> &best_path)
+    {
+        if (!config.corridor_publish_debug)
+        {
+            return;
+        }
+
+        ros::Time stamp = ros::Time::now();
+
+        if (corridor_centerline_pub_.getNumSubscribers() > 0)
+        {
+            nav_msgs::Path centerline_msg;
+            centerline_msg.header.frame_id = frame_id;
+            centerline_msg.header.stamp = stamp;
+            centerline_msg.poses.reserve(centerline.size());
+            for (const auto &pt : centerline)
+            {
+                geometry_msgs::PoseStamped pose;
+                pose.header = centerline_msg.header;
+                pose.pose.position.x = pt.x();
+                pose.pose.position.y = pt.y();
+                pose.pose.orientation.w = 1.0;
+                centerline_msg.poses.push_back(pose);
+            }
+            corridor_centerline_pub_.publish(centerline_msg);
+        }
+
+        if (best_trajectory_pub_.getNumSubscribers() > 0 && !best_path.empty())
+        {
+            nav_msgs::Path best_msg;
+            best_msg.header.frame_id = frame_id;
+            best_msg.header.stamp = stamp;
+            best_msg.poses.reserve(best_path.size());
+            for (size_t i = 0; i < best_path.size(); ++i)
+            {
+                geometry_msgs::PoseStamped pose;
+                pose.header = best_msg.header;
+                pose.pose.position.x = best_path[i].x();
+                pose.pose.position.y = best_path[i].y();
+                double yaw = 0.0;
+                if (i + 1 < best_path.size())
+                {
+                    Eigen::Vector2d dir = best_path[i + 1] - best_path[i];
+                    yaw = std::atan2(dir.y(), dir.x());
+                }
+                else if (!best_path.empty() && i > 0)
+                {
+                    Eigen::Vector2d dir = best_path[i] - best_path[i - 1];
+                    yaw = std::atan2(dir.y(), dir.x());
+                }
+                tf2::Quaternion q;
+                q.setRPY(0.0, 0.0, yaw);
+                pose.pose.orientation = tf2::toMsg(q);
+                best_msg.poses.push_back(pose);
+            }
+            best_trajectory_pub_.publish(best_msg);
+        }
+
+        if (corridor_boundary_pub_.getNumSubscribers() > 0 && !centerline.empty())
+        {
+            visualization_msgs::Marker bounds_marker;
+            bounds_marker.header.frame_id = frame_id;
+            bounds_marker.header.stamp = stamp;
+            bounds_marker.ns = "corridor_bounds";
+            bounds_marker.id = 0;
+            bounds_marker.type = visualization_msgs::Marker::LINE_LIST;
+            bounds_marker.action = visualization_msgs::Marker::ADD;
+            bounds_marker.scale.x = 0.05;
+            bounds_marker.color.r = 0.2f;
+            bounds_marker.color.g = 0.7f;
+            bounds_marker.color.b = 1.0f;
+            bounds_marker.color.a = 0.8f;
+
+            for (size_t i = 0; i < centerline.size(); ++i)
+            {
+                Eigen::Vector2d normal(-std::sin(headings[i]), std::cos(headings[i]));
+                geometry_msgs::Point left, right;
+                Eigen::Vector2d left_vec = centerline[i] + normal * bounds[i].second;
+                Eigen::Vector2d right_vec = centerline[i] + normal * bounds[i].first;
+                left.x = left_vec.x();
+                left.y = left_vec.y();
+                left.z = 0.0;
+                right.x = right_vec.x();
+                right.y = right_vec.y();
+                right.z = 0.0;
+                bounds_marker.points.push_back(left);
+                bounds_marker.points.push_back(right);
+            }
+
+            corridor_boundary_pub_.publish(bounds_marker);
+        }
     }
 
     void FTCPlanner::calculate_velocity_commands(double dt, geometry_msgs::TwistStamped &cmd_vel)
@@ -610,20 +1287,59 @@ namespace ftc_local_planner
         // calculate cost of footprint at robots actual pose
         if (config.obstacle_footprint)
         {
-        costmap->getOrientedFootprint(footprint);
-        for (int i = 0; i < footprint.size(); i++)
-        {
-            // check cost of each point of footprint
-            if (costmap_map_->worldToMap(footprint[i].x, footprint[i].y, x, y))
+            costmap->getOrientedFootprint(footprint);
+            for (size_t i = 0; i < footprint.size(); i++)
             {
-                unsigned char costs = costmap_map_->getCost(x, y);
-                if (costs >= costmap_2d::LETHAL_OBSTACLE)
+                // check cost of each point of footprint
+                if (costmap_map_->worldToMap(footprint[i].x, footprint[i].y, x, y))
                 {
-                    ROS_WARN("FTCLocalPlannerROS: Possible collision of footprint at actual pose. Stop local planner.");
-                    return true;
+                    unsigned char costs = costmap_map_->getCost(x, y);
+                    if (costs >= costmap_2d::LETHAL_OBSTACLE)
+                    {
+                        ROS_WARN("FTCLocalPlannerROS: Possible collision of footprint at actual pose. Stop local planner.");
+                        return true;
+                    }
                 }
             }
         }
+
+        if (config.enable_corridor_planning && !last_best_path_world_.empty())
+        {
+            geometry_msgs::PoseStamped robot_pose;
+            bool have_robot_pose = costmap->getRobotPose(robot_pose);
+            Eigen::Vector2d previous_point;
+            if (have_robot_pose)
+            {
+                previous_point = Eigen::Vector2d(robot_pose.pose.position.x, robot_pose.pose.position.y);
+            }
+            else
+            {
+                previous_point = last_best_path_world_.front();
+            }
+
+            double max_distance = std::max(0.0, config.corridor_length);
+            double traversed = 0.0;
+            for (size_t i = 0; i < last_best_path_world_.size(); ++i)
+            {
+                Eigen::Vector2d next_point = last_best_path_world_[i];
+                double seg_dynamic = 0.0;
+                bool lethal = false;
+                double seg_collision = segmentCollisionCost(previous_point, next_point, seg_dynamic, lethal);
+                (void)seg_collision;
+                if (lethal)
+                {
+                    ROS_WARN_THROTTLE(1.0, "FTCLocalPlannerROS: Corridor trajectory became occupied. Stopping planner.");
+                    return true;
+                }
+                traversed += (next_point - previous_point).norm();
+                previous_point = next_point;
+                if (max_distance > 0.0 && traversed >= max_distance)
+                {
+                    break;
+                }
+            }
+
+            return false;
         }
 
         for (int i = 0; i < max_points; i++)
